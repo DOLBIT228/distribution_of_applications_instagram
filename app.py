@@ -1,6 +1,7 @@
 from collections import defaultdict
 from contextlib import closing
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 import base64
 import re
@@ -180,13 +181,18 @@ def is_prefix_in_title(deal: Dict, prefix: str) -> bool:
 
 def deal_starts_with_us_number(deal: Dict) -> bool:
     title = str(deal.get("TITLE") or "").strip()
-    compact_title = title.replace(" ", "")
-    return bool(re.match(r"^\+1", compact_title))
+    # Телефон може бути не на початку заголовка: шукаємо міжнародний префікс +1 по всьому рядку.
+    return bool(re.search(r"\+1(?:[\s\-().]*\d){7,}", title))
 
 
 def is_after_distribution_time() -> bool:
-    # Обмеження для заявок з номером +1 діє до 17:00 локального часу сервера.
-    return datetime.now().hour >= 17
+    # Обмеження для заявок з номером +1 діє до 17:00 за київським часом.
+    timezone_name = str(_secret_optional("distribution.timezone", "Europe/Kyiv") or "Europe/Kyiv")
+    try:
+        now_local = datetime.now(ZoneInfo(timezone_name))
+    except Exception:
+        now_local = datetime.now(ZoneInfo("Europe/Kyiv"))
+    return now_local.hour >= 17
 
 
 def parse_term_priority(value: Optional[str]) -> int:
