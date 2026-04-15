@@ -115,6 +115,7 @@ def fetch_deals(category_id: int, stage_id: str, limit: int | None = None) -> Li
             "select": [
                 "ID",
                 "TITLE",
+                "PHONE",
                 "ASSIGNED_BY_ID",
                 "SOURCE_ID",
                 TERM_FIELD_CODE,
@@ -179,10 +180,35 @@ def is_prefix_in_title(deal: Dict, prefix: str) -> bool:
     return title.startswith(prefix)
 
 
-def deal_starts_with_us_number(deal: Dict) -> bool:
-    title = str(deal.get("TITLE") or "").strip()
-    # Телефон може бути не на початку заголовка: шукаємо міжнародний префікс +1 по всьому рядку.
-    return bool(re.search(r"\+1(?:[\s\-().]*\d){7,}", title))
+def _collect_phone_like_values(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        values: List[str] = []
+        for nested_value in value.values():
+            values.extend(_collect_phone_like_values(nested_value))
+        return values
+    if isinstance(value, (list, tuple, set)):
+        values: List[str] = []
+        for nested_value in value:
+            values.extend(_collect_phone_like_values(nested_value))
+        return values
+    return [str(value)]
+
+
+def deal_has_us_number(deal: Dict) -> bool:
+    # Телефон з +1 може бути в TITLE або в полях PHONE/communications.
+    values_to_check: List[str] = _collect_phone_like_values(deal.get("TITLE"))
+    values_to_check.extend(_collect_phone_like_values(deal.get("PHONE")))
+
+    # Деякі інсталяції зберігають контакти у custom полях, тож перевіряємо всі UF_CRM_* поля.
+    for field_name, field_value in deal.items():
+        if str(field_name).startswith("UF_CRM_"):
+            values_to_check.extend(_collect_phone_like_values(field_value))
+
+    return any(bool(re.search(r"\+1(?:[\s\-().]*\d){7,}", text)) for text in values_to_check)
 
 
 def is_after_distribution_time() -> bool:
@@ -633,7 +659,7 @@ def run_distribution_once(
     term_deals: List[Dict] = []
     consultation_deals: List[Dict] = []
     for deal in deals_all:
-        if deal_starts_with_us_number(deal) and not is_after_distribution_time():
+        if deal_has_us_number(deal) and not is_after_distribution_time():
             continue
         deal_type = classify_deal_type(deal, source_map, distribution_logic)
         if deal_type == "Консультація":
