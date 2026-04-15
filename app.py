@@ -1,5 +1,4 @@
 from collections import defaultdict
-from contextlib import closing
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -293,41 +292,9 @@ def init_db() -> None:
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_preferences (
-                user_login TEXT PRIMARY KEY,
-                hide_onboarding INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
         conn.commit()
     finally:
         conn.close()
-
-
-def should_show_onboarding(user_login: str) -> bool:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        row = conn.execute(
-            "SELECT hide_onboarding FROM user_preferences WHERE user_login = ?",
-            (user_login,),
-        ).fetchone()
-    if not row:
-        return True
-    return int(row[0]) == 0
-
-
-def set_onboarding_visibility(user_login: str, hide_onboarding: bool) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            """
-            INSERT INTO user_preferences (user_login, hide_onboarding)
-            VALUES (?, ?)
-            ON CONFLICT(user_login) DO UPDATE SET hide_onboarding = excluded.hide_onboarding
-            """,
-            (user_login, 1 if hide_onboarding else 0),
-        )
-        conn.commit()
 
 
 def render_onboarding_video(media_path: Path) -> None:
@@ -763,11 +730,9 @@ def run_distribution_once(
 
 
 @st.fragment
-def render_onboarding_modal(user_login: str) -> None:
+def render_onboarding_modal() -> None:
     if "onboarding_step" not in st.session_state:
         st.session_state["onboarding_step"] = 0
-    if "onboarding_do_not_show" not in st.session_state:
-        st.session_state["onboarding_do_not_show"] = False
 
     steps = [
         {
@@ -895,7 +860,6 @@ def render_onboarding_modal(user_login: str) -> None:
                 unsafe_allow_html=True,
             )
         st.caption(f"Крок {step + 1} з {len(steps)}")
-        st.checkbox("Більше не показувати", key="onboarding_do_not_show")
 
         col_prev, col_next, col_close = st.columns(3)
         with col_prev:
@@ -905,14 +869,12 @@ def render_onboarding_modal(user_login: str) -> None:
             next_label = "Завершити" if step == len(steps) - 1 else "Далі"
             if st.button(next_label, type="primary", key="onboarding_next"):
                 if step >= len(steps) - 1:
-                    set_onboarding_visibility(user_login, bool(st.session_state.get("onboarding_do_not_show")))
                     st.session_state["onboarding_step"] = 0
                     st.session_state["show_onboarding"] = False
                 else:
                     st.session_state["onboarding_step"] = step + 1
         with col_close:
             if st.button("Закрити", key="onboarding_close"):
-                set_onboarding_visibility(user_login, bool(st.session_state.get("onboarding_do_not_show")))
                 st.session_state["onboarding_step"] = 0
                 st.session_state["show_onboarding"] = False
                 st.rerun()
@@ -937,7 +899,6 @@ def login_screen() -> None:
 
 def distribution_screen() -> None:
     user = st.session_state.get("user", {})
-    user_login = str(user.get("login") or "")
 
     st.title("Розподіл заявок між менеджерами")
     st.caption(
@@ -972,10 +933,10 @@ def distribution_screen() -> None:
     if "reconfig_previous_managers" not in st.session_state:
         st.session_state["reconfig_previous_managers"] = []
     if "show_onboarding" not in st.session_state:
-        st.session_state["show_onboarding"] = should_show_onboarding(user_login)
+        st.session_state["show_onboarding"] = False
 
     if st.session_state.get("show_onboarding"):
-        render_onboarding_modal(user_login)
+        render_onboarding_modal()
         st.info("Онбординг активний. Основний екран не оновлюється, доки не закриєте онбординг.")
         return
 
@@ -1254,7 +1215,7 @@ def distribution_screen() -> None:
         st.rerun()
 
     if st.session_state.get("show_onboarding"):
-        render_onboarding_modal(user_login)
+        render_onboarding_modal()
 
 
 init_db()
