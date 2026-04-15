@@ -3,6 +3,7 @@ from contextlib import closing
 from datetime import date, datetime
 from pathlib import Path
 import base64
+import re
 import sqlite3
 import time
 from typing import Dict, List, Optional
@@ -41,6 +42,10 @@ DEFAULT_BATCH_SIZE = 3
 ONBOARDING_MEDIA_DIR = Path("onboarding_media")
 
 SITE_DEAL_TYPES = ["Сайт (Тест)"]
+CONSULTATION_PREFIX = "КОНСУЛЬТАЦІЯ"
+REPEAT_PREFIX = "ПОВТОРНЕ"
+BASE_PREFIX = "БАЗА"
+TERM_FIELD_CODE = "UF_CRM_1749123119"
 
 
 def _secret_required(path: str):
@@ -94,7 +99,14 @@ def fetch_deals(category_id: int, stage_id: str, limit: int | None = None) -> Li
                 "STAGE_ID": stage_id,
             },
             "order": {"ID": "ASC"},
-            "select": ["ID", "TITLE", "ASSIGNED_BY_ID", "SOURCE_ID"],
+            "select": [
+                "ID",
+                "TITLE",
+                "ASSIGNED_BY_ID",
+                "SOURCE_ID",
+                TERM_FIELD_CODE,
+                "DATE_MODIFY",
+            ],
             "start": start,
         }
 
@@ -135,16 +147,52 @@ def fetch_source_map() -> Dict[str, str]:
 
 
 def get_direction_logic(direction_name: str, direction: Dict) -> str:
-    # У поточній версії додатка підтримується лише логіка Сайт (Тест).
-    return "site"
+    return "instagram"
 
 
 def classify_deal_type(deal: Dict, source_map: Dict[str, str], logic: str) -> str:
-    return "Сайт (Тест)"
+    title = str(deal.get("TITLE") or "").strip().upper()
+    if title.startswith(CONSULTATION_PREFIX):
+        return "Консультація"
+    return "Термін"
 
 
 def get_deal_types_for_logic(logic: str) -> List[str]:
-    return SITE_DEAL_TYPES
+    return ["Консультація", "Термін", "Повторне", "База"]
+
+
+def is_prefix_in_title(deal: Dict, prefix: str) -> bool:
+    title = str(deal.get("TITLE") or "").strip().upper()
+    return title.startswith(prefix)
+
+
+def deal_starts_with_us_number(deal: Dict) -> bool:
+    title = str(deal.get("TITLE") or "").strip()
+    compact_title = title.replace(" ", "")
+    return bool(re.match(r"^\+1", compact_title))
+
+
+def is_after_distribution_time() -> bool:
+    # Обмеження для заявок з номером +1 діє до 17:00 локального часу сервера.
+    return datetime.now().hour >= 17
+
+
+def parse_term_datetime(value: Optional[str]) -> datetime:
+    if not value:
+        return datetime.max
+    text_value = str(value).strip()
+    if not text_value:
+        return datetime.max
+    text_value = text_value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text_value)
+    except ValueError:
+        for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.strptime(text_value, fmt)
+            except ValueError:
+                continue
+    return datetime.max
 
 
 def update_deal_assignment_and_stage(deal_id: int, manager_id: int, next_stage_id: str) -> None:
@@ -402,6 +450,48 @@ def get_daily_manager_state(
         conn.close()
 
 
+def get_last_manager_for_type_today(direction_name: str, deal_type: str) -> Optional[str]:
+    distribution_date = date.today().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            """
+            SELECT manager_name
+            FROM distribution_history
+            WHERE distribution_date = ? AND direction_name = ? AND deal_type = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (distribution_date, direction_name, deal_type),
+        ).fetchone()
+        if not row:
+            return None
+        return str(row[0])
+    finally:
+        conn.close()
+
+
+def select_manager_round_robin(
+    selected_managers: List[str],
+    remaining_slots: Dict[str, int],
+    last_manager: Optional[str],
+) -> str:
+    under_limit = [manager for manager in selected_managers if int(remaining_slots[manager]) > 0]
+    if not under_limit:
+        raise RuntimeError("Немає доступних менеджерів для добору до ліміту.")
+
+    if not last_manager or last_manager not in selected_managers:
+        return under_limit[0]
+
+    start_idx = (selected_managers.index(last_manager) + 1) % len(selected_managers)
+    for offset in range(len(selected_managers)):
+        manager = selected_managers[(start_idx + offset) % len(selected_managers)]
+        if manager in under_limit:
+            return manager
+
+    raise RuntimeError("Немає доступних менеджерів для round-robin.")
+
+
 def select_manager_for_deal(
     deal_type: str,
     selected_managers: List[str],
@@ -471,6 +561,7 @@ def run_distribution_once(
     manager_options: Dict[str, int],
     deals_all: List[Dict],
     source_map: Dict[str, str],
+    repeat_stage_id: str,
 ) -> Dict:
     if not selected_managers:
         return {"status": "warning", "message": "Оберіть хоча б одного менеджера."}
@@ -502,31 +593,44 @@ def run_distribution_once(
         }
 
     max_for_batch = sum(remaining_slots[manager_name] for manager_name in available_managers)
-    distribution_size = min(len(deals_all), max_for_batch)
-    target_deals = deals_all[:distribution_size]
+
+    term_deals: List[Dict] = []
+    consultation_deals: List[Dict] = []
+    for deal in deals_all:
+        if deal_starts_with_us_number(deal) and not is_after_distribution_time():
+            continue
+        deal_type = classify_deal_type(deal, source_map, distribution_logic)
+        if deal_type == "Консультація":
+            consultation_deals.append(deal)
+        else:
+            term_deals.append(deal)
+    term_deals.sort(key=lambda item: (parse_term_datetime(item.get(TERM_FIELD_CODE)), int(item["ID"])))
+
+    repeat_deals: List[Dict] = []
+    if repeat_stage_id:
+        repeat_all = fetch_deals(category_id, repeat_stage_id, limit=None)
+        repeat_deals = [
+            deal
+            for deal in repeat_all
+            if is_prefix_in_title(deal, REPEAT_PREFIX) or is_prefix_in_title(deal, BASE_PREFIX)
+        ]
+        repeat_deals.sort(key=lambda item: (parse_term_datetime(item.get("DATE_MODIFY")), int(item["ID"])))
 
     manager_state = get_daily_manager_state(direction_name, available_managers, deal_types)
     results = []
+    last_manager_by_type = {
+        "Консультація": get_last_manager_for_type_today(direction_name, "Консультація"),
+        "Термін": get_last_manager_for_type_today(direction_name, "Термін"),
+    }
 
-    for deal in target_deals:
-        deal_type = classify_deal_type(deal, source_map, distribution_logic)
-        manager_name = select_manager_for_deal(
-            deal_type,
-            available_managers,
-            manager_state,
-            distribution_logic,
-            remaining_slots,
-            batch_size,
-        )
+    def register_result(deal: Dict, manager_name: str, deal_type: str):
         manager_id = manager_ids[manager_name]
-
         if deal_type not in manager_state[manager_name]:
             manager_state[manager_name][deal_type] = 0
         manager_state[manager_name][deal_type] = int(manager_state[manager_name][deal_type]) + 1
         manager_state[manager_name]["total"] = int(manager_state[manager_name]["total"]) + 1
         manager_state[manager_name]["last_type"] = deal_type
         remaining_slots[manager_name] = int(remaining_slots[manager_name]) - 1
-
         update_deal_assignment_and_stage(int(deal["ID"]), manager_id, target_stage_id)
         results.append(
             {
@@ -537,6 +641,51 @@ def run_distribution_once(
                 "next_stage": target_stage_id,
             }
         )
+
+    for deal in repeat_deals:
+        if len(results) >= max_for_batch:
+            break
+        responsible_id = int(deal.get("ASSIGNED_BY_ID") or 0)
+        responsible_name = next((name for name in available_managers if manager_ids[name] == responsible_id), None)
+        is_repeat = is_prefix_in_title(deal, REPEAT_PREFIX)
+        is_base = is_prefix_in_title(deal, BASE_PREFIX)
+
+        if responsible_name and int(remaining_slots[responsible_name]) > 0:
+            register_result(deal, responsible_name, "Повторне" if is_repeat else "База")
+            continue
+
+        if is_base:
+            fallback_manager = select_manager_for_deal(
+                "База",
+                available_managers,
+                manager_state,
+                distribution_logic,
+                remaining_slots,
+                batch_size,
+            )
+            register_result(deal, fallback_manager, "База")
+
+    for deal in consultation_deals:
+        if len(results) >= max_for_batch:
+            break
+        manager_name = select_manager_round_robin(
+            available_managers,
+            remaining_slots,
+            last_manager_by_type["Консультація"],
+        )
+        register_result(deal, manager_name, "Консультація")
+        last_manager_by_type["Консультація"] = manager_name
+
+    for deal in term_deals:
+        if len(results) >= max_for_batch:
+            break
+        manager_name = select_manager_round_robin(
+            available_managers,
+            remaining_slots,
+            last_manager_by_type["Термін"],
+        )
+        register_result(deal, manager_name, "Термін")
+        last_manager_by_type["Термін"] = manager_name
 
     store_distribution_rows(direction_name, results)
 
@@ -791,6 +940,7 @@ def distribution_screen() -> None:
     deal_types = get_deal_types_for_logic(distribution_logic)
     batch_size = int(direction.get("batch_size") or DEFAULT_BATCH_SIZE)
     auto_interval_seconds = int(direction.get("auto_interval_seconds") or 30)
+    repeat_stage_id = str(direction.get("repeat_status_id") or "").strip()
 
     if not target_stage_id:
         st.warning(
@@ -808,7 +958,7 @@ def distribution_screen() -> None:
     available_count = len(deals_all)
     st.info(f"Знайдено заявок у статусі: **{available_count}**")
 
-    st.caption("Логіка напрямку: Сайт (Тест)")
+    st.caption("Логіка напрямку: Instagram")
 
     with st.container(key="onboarding_actions_block"):
         action_col1, action_col2, action_col3, action_col4 = st.columns(4)
@@ -935,6 +1085,7 @@ def distribution_screen() -> None:
                 manager_options=manager_options,
                 deals_all=deals_all,
                 source_map=source_map,
+                repeat_stage_id=repeat_stage_id,
             )
         st.session_state["auto_distribution_last_run"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
