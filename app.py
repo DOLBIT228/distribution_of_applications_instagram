@@ -46,6 +46,18 @@ CONSULTATION_PREFIX = "КОНСУЛЬТАЦІЯ"
 REPEAT_PREFIX = "ПОВТОРНЕ"
 BASE_PREFIX = "БАЗА"
 TERM_FIELD_CODE = "UF_CRM_1749123119"
+TERM_PRIORITY_ORDER = {
+    "46945": 0,  # Ближчим часом
+    "46947": 1,  # Завчасно
+    "46949": 2,  # Без терміну
+    "47027": 3,  # На майбутнє
+}
+TERM_PRIORITY_LABELS = {
+    "БЛИЖЧИМ ЧАСОМ": 0,
+    "ЗАВЧАСНО": 1,
+    "БЕЗ ТЕРМІНУ": 2,
+    "НА МАЙБУТНЄ": 3,
+}
 
 
 def _secret_required(path: str):
@@ -177,7 +189,25 @@ def is_after_distribution_time() -> bool:
     return datetime.now().hour >= 17
 
 
-def parse_term_datetime(value: Optional[str]) -> datetime:
+def parse_term_priority(value: Optional[str]) -> int:
+    if value is None:
+        return max(TERM_PRIORITY_ORDER.values()) + 1
+
+    text_value = str(value).strip()
+    if not text_value:
+        return max(TERM_PRIORITY_ORDER.values()) + 1
+
+    if text_value in TERM_PRIORITY_ORDER:
+        return TERM_PRIORITY_ORDER[text_value]
+
+    upper_value = text_value.upper()
+    if upper_value in TERM_PRIORITY_LABELS:
+        return TERM_PRIORITY_LABELS[upper_value]
+
+    return max(TERM_PRIORITY_ORDER.values()) + 1
+
+
+def parse_datetime_value(value: Optional[str]) -> datetime:
     if not value:
         return datetime.max
     text_value = str(value).strip()
@@ -604,7 +634,7 @@ def run_distribution_once(
             consultation_deals.append(deal)
         else:
             term_deals.append(deal)
-    term_deals.sort(key=lambda item: (parse_term_datetime(item.get(TERM_FIELD_CODE)), int(item["ID"])))
+    term_deals.sort(key=lambda item: (parse_term_priority(item.get(TERM_FIELD_CODE)), int(item["ID"])))
 
     repeat_deals: List[Dict] = []
     if repeat_stage_id:
@@ -614,7 +644,7 @@ def run_distribution_once(
             for deal in repeat_all
             if is_prefix_in_title(deal, REPEAT_PREFIX) or is_prefix_in_title(deal, BASE_PREFIX)
         ]
-        repeat_deals.sort(key=lambda item: (parse_term_datetime(item.get("DATE_MODIFY")), int(item["ID"])))
+        repeat_deals.sort(key=lambda item: (parse_datetime_value(item.get("DATE_MODIFY")), int(item["ID"])))
 
     manager_state = get_daily_manager_state(direction_name, available_managers, deal_types)
     results = []
