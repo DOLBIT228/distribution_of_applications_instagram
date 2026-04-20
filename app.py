@@ -45,6 +45,9 @@ SITE_DEAL_TYPES = ["Сайт (Тест)"]
 CONSULTATION_PREFIX = "КОНСУЛЬТАЦІЯ"
 REPEAT_PREFIX = "ПОВТОРНЕ"
 BASE_PREFIX = "БАЗА"
+UNTIL_MONTH_PREFIX = "ДО МІСЯЦЯ"
+USA_PREFIX = "США"
+BLOCK_PREFIX = "БЛОК"
 TERM_FIELD_CODE = "UF_CRM_1749123119"
 TERM_PRIORITY_ORDER = {
     "46945": 0,  # Ближчим часом
@@ -58,6 +61,8 @@ TERM_PRIORITY_LABELS = {
     "БЕЗ ТЕРМІНУ": 2,
     "НА МАЙБУТНЄ": 3,
 }
+TERM_NEAR_LABEL = "Ближчим часом"
+TERM_FUTURE_LABEL = "Майбутнє"
 
 
 def _secret_required(path: str):
@@ -256,6 +261,27 @@ def parse_datetime_value(value: Optional[str]) -> datetime:
     return datetime.max
 
 
+def is_skipped_by_title_prefix(deal: Dict) -> bool:
+    return is_prefix_in_title(deal, USA_PREFIX) or is_prefix_in_title(deal, BLOCK_PREFIX)
+
+
+def is_until_month_deal(deal: Dict) -> bool:
+    return is_prefix_in_title(deal, UNTIL_MONTH_PREFIX)
+
+
+def get_term_group_label(value: Optional[str]) -> Optional[str]:
+    term_priority = parse_term_priority(value)
+    if term_priority == TERM_PRIORITY_ORDER["46945"]:
+        return TERM_NEAR_LABEL
+    if term_priority in {
+        TERM_PRIORITY_ORDER["46947"],
+        TERM_PRIORITY_ORDER["46949"],
+        TERM_PRIORITY_ORDER["47027"],
+    }:
+        return TERM_FUTURE_LABEL
+    return None
+
+
 def update_deal_assignment_and_stage(deal_id: int, manager_id: int, next_stage_id: str) -> None:
     payload = {
         "id": int(deal_id),
@@ -292,6 +318,12 @@ def init_db() -> None:
             )
             """
         )
+        existing_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(distribution_history)").fetchall()
+        }
+        if "term_group" not in existing_columns:
+            conn.execute("ALTER TABLE distribution_history ADD COLUMN term_group TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -326,8 +358,9 @@ def store_distribution_rows(direction_name: str, rows: List[Dict]) -> None:
                 direction_name,
                 manager_name,
                 deal_type,
-                deal_id
-            ) VALUES (?, ?, ?, ?, ?)
+                deal_id,
+                term_group
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -336,6 +369,7 @@ def store_distribution_rows(direction_name: str, rows: List[Dict]) -> None:
                     row["manager"],
                     row["deal_type"],
                     int(row["deal_id"]),
+                    row.get("term_group"),
                 )
                 for row in rows
             ],
@@ -565,6 +599,27 @@ def clear_daily_distribution(direction_name: str) -> int:
 
 def build_summary_table(direction_name: str, selected_managers: List[str], deal_types: List[str]) -> List[Dict]:
     summary = get_daily_summary(direction_name)
+    distribution_date = date.today().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    term_group_summary: Dict[str, Dict[str, int]] = defaultdict(lambda: {TERM_NEAR_LABEL: 0, TERM_FUTURE_LABEL: 0})
+    try:
+        cursor = conn.execute(
+            """
+            SELECT manager_name, term_group, COUNT(*)
+            FROM distribution_history
+            WHERE distribution_date = ? AND direction_name = ? AND term_group IS NOT NULL
+            GROUP BY manager_name, term_group
+            """,
+            (distribution_date, direction_name),
+        )
+        for manager_name, term_group, count in cursor.fetchall():
+            manager_key = str(manager_name)
+            term_group_key = str(term_group)
+            if term_group_key in {TERM_NEAR_LABEL, TERM_FUTURE_LABEL}:
+                term_group_summary[manager_key][term_group_key] = int(count)
+    finally:
+        conn.close()
+
     table: List[Dict] = []
 
     managers_to_show = selected_managers or sorted(summary.keys())
@@ -572,6 +627,8 @@ def build_summary_table(direction_name: str, selected_managers: List[str], deal_
         row = {"Менеджер": manager}
         for deal_type in deal_types:
             row[deal_type] = summary.get(manager, {}).get(deal_type, 0)
+        row["Термін: ближчий час"] = term_group_summary.get(manager, {}).get(TERM_NEAR_LABEL, 0)
+        row["Термін: майбутнє"] = term_group_summary.get(manager, {}).get(TERM_FUTURE_LABEL, 0)
         table.append(row)
 
     return table
@@ -626,6 +683,8 @@ def run_distribution_once(
     term_deals: List[Dict] = []
     consultation_deals: List[Dict] = []
     for deal in deals_all:
+        if is_skipped_by_title_prefix(deal):
+            continue
         if deal_has_us_number(deal) and not is_after_distribution_time():
             continue
         deal_type = classify_deal_type(deal, source_map, distribution_logic)
@@ -633,7 +692,13 @@ def run_distribution_once(
             consultation_deals.append(deal)
         else:
             term_deals.append(deal)
-    term_deals.sort(key=lambda item: (parse_term_priority(item.get(TERM_FIELD_CODE)), int(item["ID"])))
+    term_deals.sort(
+        key=lambda item: (
+            0 if is_until_month_deal(item) else 1,
+            parse_term_priority(item.get(TERM_FIELD_CODE)),
+            int(item["ID"]),
+        )
+    )
 
     repeat_deals: List[Dict] = []
     if repeat_stage_id:
@@ -652,7 +717,7 @@ def run_distribution_once(
         "Термін": get_last_manager_for_type_today(direction_name, "Термін"),
     }
 
-    def register_result(deal: Dict, manager_name: str, deal_type: str):
+    def register_result(deal: Dict, manager_name: str, deal_type: str, term_group: Optional[str] = None):
         manager_id = manager_ids[manager_name]
         if deal_type not in manager_state[manager_name]:
             manager_state[manager_name][deal_type] = 0
@@ -668,6 +733,7 @@ def run_distribution_once(
                 "deal_type": deal_type,
                 "manager": manager_name,
                 "next_stage": target_stage_id,
+                "term_group": term_group,
             }
         )
 
@@ -713,7 +779,7 @@ def run_distribution_once(
             remaining_slots,
             last_manager_by_type["Термін"],
         )
-        register_result(deal, manager_name, "Термін")
+        register_result(deal, manager_name, "Термін", get_term_group_label(deal.get(TERM_FIELD_CODE)))
         last_manager_by_type["Термін"] = manager_name
 
     store_distribution_rows(direction_name, results)
